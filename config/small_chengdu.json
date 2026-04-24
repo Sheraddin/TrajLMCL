@@ -1,0 +1,143 @@
+[
+    {
+        "repeat": 1,
+        "batch_size": 16,
+        "kd_weight": 5.0,
+        "num_cl_tasks": 5,
+        "data": {
+            "name": "small_chengdu",
+            "road_type": "road_network"
+        },
+        "models": [
+            {
+                "name": "let",
+                "config": {
+                    "d_model": 768,
+                    "output_size": 128,
+                    "model_class": "gpt2",
+                    "dis_feats": [1, 5, 7],
+                    "num_embeds": [4315, 7, 24],
+                    "con_feats": [0, 3, 4, 8, 9, 10],
+                    "two_stage": false,
+                    "lora": true,
+                    "lora_alpha": 32,
+                    "lora_dim": 16,
+                    "wpe_ft": false,
+                    "semantic_projecting": true,
+                    "add_poi": true,
+                    "add_conv_embedder": true,
+                    "kernel_size": 5,
+                    "num_virtual_anchors": 15
+                }
+            }
+        ],
+        "pretrain": {
+            "load": false,
+            "loss": {
+                "name": "trip_causal",
+                "config": {
+                    "latent_size": 768,
+                    "out_dis": { "feats": [1], "num_embeds": [4315] },
+                    "out_con_feas": [3, 4, 8, 9, 10],
+                    "dis_weight": 0.5,
+                    "con_weight": 0.5,
+                    "shift_labels": true,
+                    "add_poi": true
+                }
+            },
+            "dataloader": {
+                "name": "trip_with_odpoi_hour",
+                "meta_types": ["trip", "odpois-3"],
+                "dataset_config": {},
+                "config": {
+                    "batch_size": 16,
+                    "shuffle": true,
+                    "num_workers": 4
+                },
+                "collate_fn_config": {}
+            },
+            "trainer": {
+                "name": "generative",
+                "config": {
+                    "num_epoch": 20,
+                    "cache_epoches": true,
+                    "lr": 5e-4
+                }
+            }
+        },
+        "downstream": [
+            {
+                "task": "destination",
+                "select_models": [0],
+                "eval_set": 2,
+                "dataloader": {
+                    "name": "trip_with_odpoi_hour",
+                    "meta_types": ["trip", "odpois-3", "destination"],
+                    "dataset_config": {},
+                    "config": {
+                        "batch_size": 16,
+                        "shuffle": true,
+                        "num_workers": 4
+                    },
+                    "collate_fn_config": {}
+                },
+                "config": {
+                    "finetune": true,
+                    "num_epoch": 20,
+                    "save_prediction": false,
+                    "lr": 5e-4,
+                    "es_epoch": 10,
+                    "pre_length": 5
+                }
+            },
+            {
+                "task": "search",
+                "select_models": [0],
+                "eval_set": 2,
+                "neg_indices": "hopnegindex-1000-5000",
+                "dataloader": {
+                    "name": "trip_with_odpoi_hour",
+                    "meta_types": ["hopqrytgt-1000", "hopqrytgtpois-1000-3"],
+                    "dataset_config": { "prop": 1 },
+                    "config": {
+                        "batch_size": 16,
+                        "shuffle": false,
+                        "num_workers": 4
+                    },
+                    "collate_fn_config": {}
+                },
+                "config": {
+                    "finetune": true,
+                    "num_epoch": 20,
+                    "save_prediction": false,
+                    "lr": 5e-4,
+                    "es_epoch": 10,
+                    "pre_length": 5
+                }
+            },
+            {
+                "task": "tte",
+                "select_models": [0],
+                "eval_set": 2,
+                "dataloader": {
+                    "name": "trip_with_odpoi_hour",
+                    "meta_types": ["trip", "odpois-3", "tte"],
+                    "dataset_config": {},
+                    "config": {
+                        "batch_size": 16,
+                        "shuffle": true,
+                        "num_workers": 4
+                    },
+                    "collate_fn_config": {}
+                },
+                "config": {
+                    "finetune": true,
+                    "num_epoch": 20,
+                    "save_prediction": false,
+                    "lr": 5e-4,
+                    "es_epoch": 10
+                }
+            }
+        ]
+    }
+]
