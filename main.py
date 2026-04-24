@@ -67,12 +67,70 @@ import utils
 # ============================================================
 #  0.  ENVIRONMENT SETUP  (must come before any CUDA call)
 # ============================================================
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 
 # ============================================================
-#  1.  REPRODUCIBILITY
+#  1.  NUMPY-SAFE JSON ENCODER
+# ============================================================
+class NumpyEncoder(json.JSONEncoder):
+    """
+    Custom JSON encoder that safely serialises NumPy scalars and arrays.
+
+    WHY THIS IS NEEDED
+    ------------------
+    HDF5 / NumPy loaders (h5py, pandas) return numpy scalar types such as
+    np.int64, np.float32, etc.  Python's built-in json module does NOT know
+    how to serialise these and raises:
+
+        TypeError: Object of type int64 is not JSON serializable
+
+    This encoder intercepts such objects and converts them to native Python
+    int / float / list before handing off to the default encoder.
+
+    Usage: json.dump(obj, fp, cls=NumpyEncoder, indent=2)
+    """
+
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        # Let the base class raise TypeError for truly unhandled types
+        return super().default(obj)
+
+
+def _sanitise_for_json(obj):
+    """
+    Recursively convert any numpy scalars / arrays inside a nested
+    dict / list structure to plain Python types.
+
+    This is a defensive belt-and-suspenders helper used before every
+    json.dump call so that even deeply nested metric dicts coming from
+    downstream task evaluators are safe to serialise.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitise_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitise_for_json(v) for v in obj]
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    return obj
+
+
+# ============================================================
+#  2.  REPRODUCIBILITY
 # ============================================================
 def set_seed(seed: int) -> None:
     """
@@ -96,7 +154,7 @@ def set_seed(seed: int) -> None:
 
 
 # ============================================================
-#  2.  LOGGING SETUP
+#  3.  LOGGING SETUP
 # ============================================================
 def setup_logging(log_dir: str, run_key: str) -> logging.Logger:
     """
@@ -131,7 +189,7 @@ def setup_logging(log_dir: str, run_key: str) -> logging.Logger:
 
 
 # ============================================================
-#  3.  DATA VALIDATION
+#  4.  DATA VALIDATION
 # ============================================================
 def validate_cl_datasets(base_name: str, task_names: List[str]) -> None:
     """
@@ -156,13 +214,13 @@ def validate_cl_datasets(base_name: str, task_names: List[str]) -> None:
     if missing:
         raise FileNotFoundError(
             f"Missing CL datasets: {missing}. "
-            "Ensure sample/meta/<name>/stat.h5 exists for each."
+            "Ensure sample/meta/<n>/stat.h5 exists for each."
         )
     logging.info("[Validation] All datasets found.")
 
 
 # ============================================================
-#  4.  DATALOADER FACTORY
+#  5.  DATALOADER FACTORY
 # ============================================================
 DATALOADER_MAP = {
     "trip_with_odpoi_hour": TripODPOIWithHour,
@@ -219,7 +277,7 @@ def build_dataloader(
 
 
 # ============================================================
-#  5.  MEMORY UTILITIES
+#  6.  MEMORY UTILITIES
 # ============================================================
 def free_memory(*objects) -> None:
     """
@@ -257,7 +315,7 @@ def restore_state(models: List[torch.nn.Module], states: List[dict]) -> None:
 
 
 # ============================================================
-#  6.  CL METRICS  (BWT / FWT)
+#  7.  CL METRICS  (BWT / FWT)
 # ============================================================
 class CLMetricsTracker:
     """
@@ -337,7 +395,7 @@ class CLMetricsTracker:
 
 
 # ============================================================
-#  7.  PRETRAIN STEP
+#  8.  PRETRAIN STEP
 # ============================================================
 def run_pretrain_step(
     *,
@@ -413,7 +471,7 @@ def run_pretrain_step(
 
 
 # ============================================================
-#  8.  DOWNSTREAM STEP
+#  9.  DOWNSTREAM STEP
 # ============================================================
 def run_downstream_step(
     *,
@@ -545,15 +603,43 @@ def run_downstream_step(
 
     metrics = trainer.eval(int(down_entry["eval_set"]), full_metric=True)
 
+    # ------------------------------------------------------------------
+    # DEFENSIVE: sanitise metrics dict for JSON serialisation.
+    #
+    # WHY: downstream task.eval() implementations sometimes return numpy
+    # scalars (np.float32, np.int64) or even None. Both break json.dump
+    # with the default encoder. We convert here so the audit log never
+    # crashes regardless of what the downstream evaluator returns.
+    # ------------------------------------------------------------------
+    if metrics is None:
+        metrics = {}
+    metrics = _sanitise_for_json(metrics)
+
+    # ------------------------------------------------------------------
+    # DIAGNOSTIC: warn when eval returns empty dict.
+    #
+    # This indicates a bug in the downstream task's eval() method — it
+    # computes and prints metrics but does not return them. The training
+    # pipeline still continues; you will see the numbers in the console
+    # log but they will be missing from the JSON audit log.
+    # ------------------------------------------------------------------
+    if not metrics:
+        logging.warning(
+            f"  [Downstream] eval() returned empty dict for task='{down_task}' "
+            f"CL-step=D{task_idx} eval=D{eval_task_idx}. "
+            "Check downstream/task.py — the eval() method likely prints "
+            "metrics to stdout but does not return them."
+        )
+
     # Restore after downstream (ensures next downstream starts clean)
     restore_state(models, backbone_state)
     free_memory()
 
-    return metrics if metrics is not None else {}
+    return metrics
 
 
 # ============================================================
-#  9.  ARGUMENT PARSING
+#  10.  ARGUMENT PARSING
 # ============================================================
 def parse_args():
     parser = ArgumentParser(
@@ -601,7 +687,7 @@ def parse_args():
 
 
 # ============================================================
-#  10.  MAIN
+#  11.  MAIN
 # ============================================================
 def main():
     args = parse_args()
@@ -668,7 +754,7 @@ def main():
             f"{'=' * 60}"
         )
 
-        # ---- 10.1  Global dataset stats (road space, embeddings) --------
+        # ---- 11.1  Global dataset stats (road space, embeddings) --------
         base_data_name: str = entry["data"]["name"]
         road_type: str = entry["data"].get("road_type", "road_network")
 
@@ -681,26 +767,33 @@ def main():
             use_nni=args.use_nni,
         )
         data_global.load_stat()
-        global_num_roads: int = data_global.data_info["num_road"]
+
+        # ------------------------------------------------------------------
+        # FIX: data_info["num_road"] is read from HDF5 via numpy/h5py and
+        # arrives as np.int64, which json.dump cannot serialise.
+        # Explicitly cast to Python int here (defence-in-depth alongside
+        # NumpyEncoder) so this scalar is safe everywhere it is used.
+        # ------------------------------------------------------------------
+        global_num_roads: int = int(data_global.data_info["num_road"])
         logging.info(f"[Init] global_num_roads = {global_num_roads}")
 
-        # ---- 10.2  CL task list from config (not hardcoded) -------------
+        # ---- 11.2  CL task list from config (not hardcoded) -------------
         # Support: config may specify num_cl_tasks; default to 5 (D0–D4).
         num_cl_tasks: int = entry.get("num_cl_tasks", 5)
         cl_task_names = [f"{base_data_name}_D{i}" for i in range(num_cl_tasks)]
         cl_eval_task_ids = list(range(1, num_cl_tasks))  # [1,2,3,4] — skip D0
 
-        # ---- 10.3  Validate all datasets exist before training ----------
+        # ---- 11.3  Validate all datasets exist before training ----------
         validate_cl_datasets(base_data_name, cl_task_names)
 
-        # ---- 10.4  Batch size (config-driven, never hardcoded) ----------
+        # ---- 11.4  Batch size (config-driven, never hardcoded) ----------
         batch_size: int = entry.get("batch_size", 8)
         kd_weight: float = entry.get("kd_weight", 5.0)
         logging.info(
             f"[Hyperparams] batch_size={batch_size} | kd_weight={kd_weight}"
         )
 
-        # ---- 10.5  Model initialisation ---------------------------------
+        # ---- 11.5  Model initialisation ---------------------------------
         models: List[torch.nn.Module] = []
         for model_entry in entry["models"]:
             model_name = model_entry["name"]
@@ -732,7 +825,7 @@ def main():
             f"[Models] {len(models)} model(s) initialised on {device}"
         )
 
-        # ---- 10.6  CL state variables -----------------------------------
+        # ---- 11.6  CL state variables -----------------------------------
         teacher_model: Optional[torch.nn.Module] = None
         saved_backbone_state: Optional[List[dict]] = None
 
@@ -745,6 +838,10 @@ def main():
                     cl_metrics[task_key] = CLMetricsTracker(cl_eval_task_ids)
 
         # Per-run JSON audit log
+        # NOTE: global_num_roads is already a Python int (cast above).
+        #       batch_size and kd_weight come from json.load() so they are
+        #       already native Python int/float. Still, we apply NumpyEncoder
+        #       to every json.dump call as belt-and-suspenders.
         audit_log = {
             "run_key": run_key,
             "seed": args.seed,
@@ -757,7 +854,7 @@ def main():
         }
 
         # ================================================================
-        # 10.7  CL STEP LOOP
+        # 11.7  CL STEP LOOP
         # ================================================================
         for task_idx, task_name in enumerate(cl_task_names):
             step_start = time.time()
@@ -776,10 +873,6 @@ def main():
             )
 
             # -- Restore backbone from previous step's clean snapshot -----
-            # WHY: Each CL step starts from the checkpoint produced by
-            # the *pretraining* of the previous step (not the downstream-
-            # fine-tuned version), so the backbone is never contaminated
-            # by task-specific head gradients.
             if not is_init and saved_backbone_state is not None:
                 logging.info(
                     "[CL] Restoring clean backbone from previous pretrain …"
@@ -797,8 +890,9 @@ def main():
                 conf_save_dir,
                 f"{run_key}_e{num_entry}_step{task_idx}.json",
             )
+            # FIX: use NumpyEncoder so numpy types from config don't crash here
             with open(step_conf_path, "w") as fp:
-                json.dump(entry, fp, indent=2)
+                json.dump(entry, fp, indent=2, cls=NumpyEncoder)
 
             log_key = f"{run_key}_e{num_entry}_step{task_idx}"
 
@@ -819,19 +913,12 @@ def main():
                 )
 
                 # -- SNAPSHOT: clean post-pretrain backbone ---------------
-                # WHY: Must free the OLD snapshot first to prevent doubling
-                # VRAM usage (each deepcopy of GPT-2 backbone ≈ 500 MB).
                 logging.info("[CL] Snapshotting clean post-pretrain backbone …")
                 if saved_backbone_state is not None:
                     free_memory(*saved_backbone_state)
                 saved_backbone_state = snapshot_state(models)
 
-                # -- TEACHER UPDATE: ALL models, not just models[0] -------
-                # WHY: If the architecture uses an ensemble or auxiliary
-                # heads, copying only models[0] produces a teacher that
-                # has never seen the contributions of the other components.
-                # We store all models in teacher_models and expose the
-                # primary (models[0]) via teacher_model for the trainer API.
+                # -- TEACHER UPDATE ---------------------------------------
                 logging.info("[CL] Updating teacher snapshot (all models) …")
                 if teacher_model is not None:
                     free_memory(teacher_model)
@@ -880,10 +967,8 @@ def main():
 
                 # Determine which historical tasks to evaluate
                 if args.eval_all_tasks:
-                    # Evaluate on D1 … D_{task_idx} for BWT computation
                     eval_task_indices = list(range(1, task_idx + 1))
                 else:
-                    # Evaluate on current task only (fast mode)
                     eval_task_indices = [task_idx]
 
                 for eval_t in eval_task_indices:
@@ -917,11 +1002,11 @@ def main():
                     )
 
                     logging.info(f"  Metrics D{task_idx}→D{eval_t}: {metrics}")
-                    step_metrics_log[f"{down_task_name}_trainD{task_idx}_evalD{eval_t}"] = metrics
+                    step_metrics_log[
+                        f"{down_task_name}_trainD{task_idx}_evalD{eval_t}"
+                    ] = metrics
 
                     # --- Record in CL metrics tracker ---
-                    # We use a single scalar per task for BWT; choose the
-                    # primary metric per task type.
                     scalar = _primary_metric(down_task_name, metrics)
                     if scalar is not None:
                         cl_metrics[down_task_name].record(
@@ -940,20 +1025,27 @@ def main():
                 )
 
             step_elapsed = time.time() - step_start
-            audit_log["cl_steps"][f"D{task_idx}"] = {
+
+            # ------------------------------------------------------------------
+            # FIX: sanitise the entire step log before inserting into audit_log
+            # so that numpy scalars from any downstream evaluator cannot cause
+            # json.dump to fail later.
+            # ------------------------------------------------------------------
+            audit_log["cl_steps"][f"D{task_idx}"] = _sanitise_for_json({
                 "elapsed_sec": round(step_elapsed, 1),
                 "metrics": step_metrics_log,
                 "bwt": {
                     k: t.bwt() for k, t in cl_metrics.items()
                 },
-            }
+            })
 
             # -- Save incremental audit log (safe against crash) ----------
             audit_path = os.path.join(
                 args.log_dir, f"{run_key}_audit.json"
             )
+            # FIX: use NumpyEncoder as belt-and-suspenders
             with open(audit_path, "w") as fp:
-                json.dump(audit_log, fp, indent=2)
+                json.dump(audit_log, fp, indent=2, cls=NumpyEncoder)
             logging.info(f"[Audit] Saved: {audit_path}")
 
         # ================================================================
@@ -971,19 +1063,20 @@ def main():
             for t, row in summary["full_matrix"].items():
                 logging.info(f"      Trained D{t}: {row}")
 
-        audit_log["final_cl_summary"] = {
-            k: t.summary() for k, t in cl_metrics.items()
-        }
+        audit_log["final_cl_summary"] = _sanitise_for_json(
+            {k: t.summary() for k, t in cl_metrics.items()}
+        )
         audit_path = os.path.join(args.log_dir, f"{run_key}_audit.json")
+        # FIX: use NumpyEncoder as belt-and-suspenders
         with open(audit_path, "w") as fp:
-            json.dump(audit_log, fp, indent=2)
+            json.dump(audit_log, fp, indent=2, cls=NumpyEncoder)
         logging.info(f"\n[Done] Full audit log: {audit_path}")
 
     logging.info("\n[TrajLMCL] All experiments finished.")
 
 
 # ============================================================
-#  11.  PRIMARY METRIC SELECTOR  (for BWT scalar tracking)
+#  12.  PRIMARY METRIC SELECTOR  (for BWT scalar tracking)
 # ============================================================
 def _primary_metric(task_name: str, metrics: dict) -> Optional[float]:
     """
@@ -996,18 +1089,26 @@ def _primary_metric(task_name: str, metrics: dict) -> Optional[float]:
     Using a tuple makes the mean ill-defined. We choose the most
     commonly reported metric per task type (MAE for TTE, ACC@1 for DP,
     ACC@1 for STS) to match the tables in the thesis results.
+
+    NOTE: key names are checked in multiple case variants because
+    different downstream task implementations may capitalise differently.
     """
-    if metrics is None:
+    if not metrics:
         return None
     if task_name == "tte":
         # Lower MAE is better → negate for consistent BWT sign
-        v = metrics.get("mae", metrics.get("MAE"))
+        v = metrics.get("mae") or metrics.get("MAE") or metrics.get("Mae")
         return -float(v) if v is not None else None
     elif task_name == "destination":
-        v = metrics.get("acc1", metrics.get("ACC@1", metrics.get("acc@1")))
+        v = (
+            metrics.get("acc1")
+            or metrics.get("ACC@1")
+            or metrics.get("acc@1")
+            or metrics.get("Acc@1")
+        )
         return float(v) if v is not None else None
     elif task_name == "search":
-        v = metrics.get("acc1", metrics.get("ACC@1"))
+        v = metrics.get("acc1") or metrics.get("ACC@1") or metrics.get("acc@1")
         return float(v) if v is not None else None
     return None
 
