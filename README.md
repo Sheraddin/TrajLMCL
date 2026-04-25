@@ -1,4 +1,4 @@
-# TrajLMCL — Trajectory Data Analysis with LLM
+# TrajLMCL — Trajectory Data Mining with LLM-powered continual learning
 
 Trajectory analysis project using a GPT-2 backbone (via LoRA fine-tuning) for road-network data. The model is trained incrementally across temporal data slices using knowledge distillation.
 
